@@ -17,6 +17,7 @@ from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from .modeling.criterion import VideoSetCriterion
 from .modeling.matcher import VideoHungarianMatcher
 from .utils.memory import retry_if_cuda_oom
+from .structures.clip_output import Videos, Clips
 
 logger = logging.getLogger(__name__)
 
@@ -29,21 +30,25 @@ class VideoMaskFormer(nn.Module):
 
     @configurable
     def __init__(
-        self,
-        *,
-        backbone: Backbone,
-        sem_seg_head: nn.Module,
-        criterion: nn.Module,
-        num_queries: int,
-        object_mask_threshold: float,
-        overlap_threshold: float,
-        metadata,
-        size_divisibility: int,
-        sem_seg_postprocess_before_inference: bool,
-        pixel_mean: Tuple[float],
-        pixel_std: Tuple[float],
-        # video
-        num_frames,
+            self,
+            *,
+            backbone: Backbone,
+            sem_seg_head: nn.Module,
+            criterion: nn.Module,
+            num_queries: int,
+            object_mask_threshold: float,
+            overlap_threshold: float,
+            metadata,
+            size_divisibility: int,
+            sem_seg_postprocess_before_inference: bool,
+            pixel_mean: Tuple[float],
+            pixel_std: Tuple[float],
+            # video
+            num_frames,
+            clip_inference,
+            clip_frame_num,
+            num_class,
+            clip_stride,
     ):
         """
         Args:
@@ -86,6 +91,10 @@ class VideoMaskFormer(nn.Module):
         self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
 
         self.num_frames = num_frames
+        self.clip_inference = clip_inference
+        self.clip_frame_num = clip_frame_num
+        self.num_class = num_class
+        self.clip_stride = clip_stride
 
     @classmethod
     def from_config(cls, cfg):
@@ -145,6 +154,10 @@ class VideoMaskFormer(nn.Module):
             "pixel_std": cfg.MODEL.PIXEL_STD,
             # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
+            "clip_inference": cfg.TEST.CLIP_INFERENCE_ON,
+            "clip_frame_num": cfg.TEST.CLIP_FRAME_NUM,
+            "num_class": cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
+            "clip_stride": cfg.TEST.CLIP_STRIDE,
         }
 
     @property
@@ -185,7 +198,8 @@ class VideoMaskFormer(nn.Module):
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
-        outputs = self.sem_seg_head(features)
+        if self.training or not self.clip_inference:
+            outputs = self.sem_seg_head(features)
 
         if self.training:
             # mask classification target
@@ -201,6 +215,45 @@ class VideoMaskFormer(nn.Module):
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
             return losses
+        elif self.clip_inference:
+            video_length = len(images)
+            image_size = images.tensor.shape[-2:]
+            interim_size = (math.ceil(image_size[0] / 4), math.ceil(image_size[1] / 4))
+            print(images.tensor.dtype)
+            video_output = Videos(
+                self.clip_frame_num, video_length, self.num_class, interim_size, self.device,images.tensor.dtype,
+                num_max_inst=50
+            )
+
+            is_last_clip = False
+            for start_idx in range(0, video_length, self.clip_stride):
+                end_idx = start_idx + self.clip_frame_num
+                if end_idx >= video_length:
+                    is_last_clip = True
+                    start_idx, end_idx = max(0, video_length - self.clip_frame_num), video_length
+
+                frame_idx = list(range(start_idx, end_idx))
+                # print(frame_idx)
+                # print(video_length)
+                # print([len(v) for v in dict(features).values()])
+                # clip_backbone_tensor = [t[frame_idx] for t in features]
+                clip_backbone_tensor = {k:v[frame_idx] for k,v in dict(features).items()}
+                outputs = self.sem_seg_head(clip_backbone_tensor)
+
+                _clip_results = self.inference_clip(outputs, image_size)
+                clip_results = Clips(frame_idx, _clip_results.to(self.device))
+
+                video_output.update(clip_results)
+
+                if is_last_clip:
+                    break
+
+            height = batched_inputs[0].get("height", image_size[0])
+            width = batched_inputs[0].get("width", image_size[1])
+
+            mask_cls_result, mask_pred_result = video_output.get_result((height, width))  # NxHxW / NxC
+            return retry_if_cuda_oom(self.inference_video)(mask_cls_result, mask_pred_result, image_size, height, width)
+
         else:
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
@@ -243,19 +296,46 @@ class VideoMaskFormer(nn.Module):
             gt_ids_per_video = torch.cat(gt_ids_per_video, dim=1)
             valid_idx = (gt_ids_per_video != -1).any(dim=-1)
 
-            gt_classes_per_video = targets_per_frame.gt_classes[valid_idx]          # N,
-            gt_ids_per_video = gt_ids_per_video[valid_idx]                          # N, num_frames
+            gt_classes_per_video = targets_per_frame.gt_classes[valid_idx]  # N,
+            gt_ids_per_video = gt_ids_per_video[valid_idx]  # N, num_frames
 
             gt_instances.append({"labels": gt_classes_per_video, "ids": gt_ids_per_video})
-            gt_masks_per_video = gt_masks_per_video[valid_idx].float()          # N, num_frames, H, W
+            gt_masks_per_video = gt_masks_per_video[valid_idx].float()  # N, num_frames, H, W
             gt_instances[-1].update({"masks": gt_masks_per_video})
 
         return gt_instances
 
+    def inference_clip(self, output, image_size):
+        print('====')
+        pred_cls = output["pred_logits"][0]
+        pred_masks = output["pred_masks"][0]
+        if len(pred_cls) > 0:
+            scores = F.softmax(pred_cls, dim=-1)[:, :-1]
+            labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(
+                self.num_queries, 1).flatten(0, 1)
+            # keep top-10 predictions
+            scores_per_image, topk_indices = scores.flatten(0, 1).topk(10, sorted=False)
+            labels_per_image = labels[topk_indices]
+            topk_indices = topk_indices // self.sem_seg_head.num_classes
+            pred_masks = pred_masks[topk_indices]
+            pred_masks = pred_masks[:, :, : image_size[0], : image_size[1]]
+
+            print('score shape:',scores.shape)
+            print('pred_cls',pred_cls.shape)
+
+            results = Instances(image_size)
+            results.scores = scores_per_image
+            results.pred_classes = labels_per_image
+            results.cls_probs = pred_cls[topk_indices]
+            print('results.cls_probs',results.cls_probs.shape)
+            results.pred_masks = pred_masks
+        return results
+
     def inference_video(self, pred_cls, pred_masks, img_size, output_height, output_width):
         if len(pred_cls) > 0:
             scores = F.softmax(pred_cls, dim=-1)[:, :-1]
-            labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
+            labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(
+                self.num_queries, 1).flatten(0, 1)
             # keep top-10 predictions
             scores_per_image, topk_indices = scores.flatten(0, 1).topk(10, sorted=False)
             labels_per_image = labels[topk_indices]
