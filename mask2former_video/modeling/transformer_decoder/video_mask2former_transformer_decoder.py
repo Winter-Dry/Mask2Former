@@ -437,7 +437,8 @@ class VideoMultiScaleMaskedTransformerDecoder(nn.Module):
             'pred_masks': predictions_mask[-1],
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask
-            )
+            ),
+            'qurry_feature': output.squeeze(1)
         }
         return out
 

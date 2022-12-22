@@ -15,3 +15,5 @@ from .data_video import (
     build_detection_test_loader,
     get_detection_dataset_dicts,
 )
+
+from .long_video_model import LongVideo_inference_model
