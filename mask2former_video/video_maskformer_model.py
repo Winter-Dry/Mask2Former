@@ -184,19 +184,19 @@ class VideoMaskFormer(nn.Module):
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
-        try:
-            features = self.backbone(images.tensor)
-            outputs = self.sem_seg_head(features)
-            print('video length:', len(images))
-        except:
-            print('video length:', len(images), 'cuda_oom')
-            return {
-                "image_size": (666, 666),
-                "pred_scores": [],
-                "pred_labels": [],
-                "pred_masks": [],
-                'qurry_feature': torch.tensor([]),
-            }
+        # try:
+        features = self.backbone(images.tensor)
+        outputs = self.sem_seg_head(features)
+        #     print('video length:', len(images))
+        # except:
+        #     print('video length:', len(images), 'cuda_oom')
+        #     return {
+        #         "image_size": (666, 666),
+        #         "pred_scores": [],
+        #         "pred_labels": [],
+        #         "pred_masks": [],
+        #         'qurry_feature': torch.tensor([]),
+        #     }
 
         if self.training:
             # mask classification target

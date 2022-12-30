@@ -65,8 +65,8 @@ class LongVideo_inference_model(nn.Module):
         #         else:
         #             raise e
 
-        clips = self.__divide_videos_fixed_length(inputs[0], frame_num=64)
-        result = self._inference_clips(clips, on_gpu=True)
+        clips = self.__divide_videos_fixed_length(inputs[0], frame_num=96)
+        result = self._inference_clips(clips, on_gpu=False)
         return result
 
     def _inference_clips(self, clips_in: list, on_gpu=False):
@@ -217,7 +217,8 @@ class LongVideo_inference_model(nn.Module):
                 final_out["pred_labels"].append(k2)
                 final_out["qurry_feature"].append(out2[k2]['qurry_feature'][i])
 
-        indx = torch.argsort(-torch.as_tensor(final_out["pred_scores"]))[:10]
+        final_max_dets = 20
+        indx = torch.argsort(-torch.as_tensor(final_out["pred_scores"]))[:final_max_dets]
 
         final_out["pred_scores"] = [final_out["pred_scores"][_m] for _m in indx]
         # list(torch.as_tensor(final_out["pred_scores"])[indx])
@@ -276,7 +277,7 @@ class LongVideo_inference_model(nn.Module):
         # print('--clip_len', [len(_c['image']) for _c in clip_list])
         return clip_list
 
-    def __divide_videos_fixed_length(self, video_in, frame_num=36):
+    def __divide_videos_fixed_length(self, video_in, frame_num=96):
         num_clip = math.ceil(video_in['length'] / frame_num)
         self.logger.info('inference on {} clips'.format(num_clip))
         if num_clip == 0:
